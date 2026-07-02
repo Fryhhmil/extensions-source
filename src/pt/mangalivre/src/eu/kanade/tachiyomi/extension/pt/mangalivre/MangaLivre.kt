@@ -239,10 +239,10 @@ abstract class MangaLivre :
     }
 
     /**
-     * O front-end fixa o header de cliente via `Headers.set("nome", "valor")` no bundle,
-     * e nome/valor rotacionam toda hora (x-toonlivre-client/web-x -> app-token/tok-z99).
-     * Em vez de fixar isso, coletamos os pares de `.set(...)` dos /assets (ignorando headers
-     * padrão) e o interceptor testa cada candidato quando a API recusa com 403.
+     * O front-end fixa o header de cliente no bundle, e nome/valor rotacionam toda
+     * hora (x-toonlivre-client/web-v8 -> x-app-key/web-z99 -> x-tly-token/v99-web-z).
+     * Em vez de fixar isso, coletamos os pares header/valor dos /assets (ignorando
+     * headers padrão) e o interceptor testa cada candidato quando a API recusa com 403.
      */
     private fun scrapeCandidates(): List<ClientToken> = try {
         val html = scrapeClient.newCall(GET("$baseUrl/", headers)).execute()
@@ -260,13 +260,16 @@ abstract class MangaLivre :
     }
 
     private fun extractCandidates(js: String): List<ClientToken> {
-        val pairs = SET_REGEX.findAll(js)
+        val pairs = (HEADER_CALL_REGEX.findAll(js) + HEADER_OBJECT_REGEX.findAll(js))
             .map { ClientToken(it.groupValues[1], it.groupValues[2]) }
             .filterNot { it.header.lowercase() in STANDARD_HEADERS }
             .distinct()
             .toList()
-        val ranked = pairs.sortedByDescending { it.value.length + if ('-' in it.value) 100 else 0 }
-            .take(MAX_CANDIDATES)
+        val ranked = pairs.sortedByDescending {
+            it.value.length +
+                (if ('-' in it.value) 100 else 0) +
+                (if (it.header.startsWith("x-", ignoreCase = true)) 50 else 0)
+        }.take(MAX_CANDIDATES)
         return (ranked + DEFAULT_TOKEN).distinct()
     }
 
@@ -285,9 +288,16 @@ abstract class MangaLivre :
         private const val MAX_CANDIDATES = 8
         private const val NON_JSON_MESSAGE =
             "Resposta não-JSON (Cloudflare ou header desatualizado). Abra a fonte na WebView do app e tente de novo."
-        private val DEFAULT_TOKEN = ClientToken("app-token", "tok-z99")
+        private val DEFAULT_TOKEN = ClientToken("x-tly-token", "v99-web-z")
         private val ASSET_REGEX = Regex("/assets/[\\w-]+\\.js")
-        private val SET_REGEX = Regex("\\.set\\(\\s*\"([A-Za-z][\\w.-]{1,40})\"\\s*,\\s*\"([^\"]{1,60})\"\\s*\\)")
+
+        // O front-end fixa o header de cliente de várias formas conforme o release:
+        // `Headers.set("nome","valor")`, `Headers.append("nome","valor")` ou um
+        // object-literal `{"x-...":"..."}` passado ao fetch/axios. Cobrimos as três.
+        private val HEADER_CALL_REGEX =
+            Regex("\\.(?:set|append)\\(\\s*\"([A-Za-z][\\w.-]{1,40})\"\\s*,\\s*\"([^\"]{1,60})\"\\s*\\)")
+        private val HEADER_OBJECT_REGEX =
+            Regex("\"(x-[\\w.-]{1,40})\"\\s*:\\s*\"([^\"]{1,60})\"", RegexOption.IGNORE_CASE)
         private val STANDARD_HEADERS = setOf("content-type", "accept", "authorization", "x-csrf-token")
     }
 }
