@@ -9,6 +9,16 @@ import kotlinx.serialization.Serializable
 import java.text.Normalizer
 
 @Serializable
+class SeedTokenDto(
+    val token: String,
+)
+
+@Serializable
+class JwtExpDto(
+    val exp: Long = 0,
+)
+
+@Serializable
 class WrapperDto(
     val mangas: List<MangaDto>,
     val pagination: PaginationDto,

@@ -1,5 +1,7 @@
 package eu.kanade.tachiyomi.extension.pt.mangalivre
 
+import android.util.Base64
+import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
@@ -18,10 +20,17 @@ import keiyoushi.utils.parseAs
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import java.io.IOException
+import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Locale
+import java.util.TimeZone
 import kotlin.time.Duration.Companion.seconds
 
 @Source
@@ -33,16 +42,18 @@ abstract class MangaLivre :
 
     override val supportsLatest: Boolean = true
 
+    // O `signatureInterceptor` injeta a assinatura `x-toon-signature` (token de
+    // /api/seed) em toda chamada à API; o `decryptInterceptor` descriptografa as
+    // respostas de conteúdo (Rabbit/CryptoJS). Ver comentários abaixo.
     override val client: OkHttpClient = network.client.newBuilder()
-        .addInterceptor(::clientHeaderInterceptor)
+        .addInterceptor(::signatureInterceptor)
+        .addInterceptor(::decryptInterceptor)
         .rateLimit(2, 1.seconds) { it.host == baseUrlHost }
         .build()
 
-    private val scrapeClient: OkHttpClient by lazy {
-        network.client.newBuilder()
-            .followRedirects(false)
-            .build()
-    }
+    // Cliente sem nossos interceptors, usado para buscar o bundle JS e o /api/seed
+    // sem recursão nem passar pelo rate limit acima.
+    private val bootstrapClient: OkHttpClient get() = network.client
 
     private val apiUrl: String = "$baseUrl/api"
 
@@ -115,7 +126,14 @@ abstract class MangaLivre :
 
     // ============================== Details =======================================
 
-    override fun getMangaUrl(manga: SManga): String = "$baseUrl/${manga.url}"
+    override fun getMangaUrl(manga: SManga): String {
+        val base = downloadUiBaseUrl
+        return if (downloadUiEnabled && base.isNotBlank()) {
+            "${base.trimEnd('/')}/download-ui/${manga.url}"
+        } else {
+            "$baseUrl/${manga.url}"
+        }
+    }
 
     override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiUrl/manga-by-slug/${manga.url}", headers)
 
@@ -126,6 +144,10 @@ abstract class MangaLivre :
     override fun chapterListRequest(manga: SManga): Request = mangaDetailsRequest(manga)
 
     override fun chapterListParse(response: Response): List<SChapter> = response.parseJson<MangaDto>().toSChapterList()
+
+    // A chapter.url é "/{slug}/{number}#{json}". O trecho antes do '#' é a página do
+    // leitor no site.
+    override fun getChapterUrl(chapter: SChapter): String = "$baseUrl${chapter.url.substringBefore("#")}"
 
     // ============================== Pages =======================================
 
@@ -166,6 +188,12 @@ abstract class MangaLivre :
     val useAlternativeTitle: Boolean get() =
         preferences.getBoolean(ALTERNATIVE_TITLE_PREF, false)
 
+    private val downloadUiEnabled: Boolean get() =
+        preferences.getBoolean(DOWNLOAD_UI_ENABLED_PREF, false)
+
+    private val downloadUiBaseUrl: String get() =
+        preferences.getString(DOWNLOAD_UI_URL_PREF, "").orEmpty().trim()
+
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         SwitchPreferenceCompat(screen.context).apply {
             key = ALTERNATIVE_TITLE_PREF
@@ -176,13 +204,214 @@ abstract class MangaLivre :
             }
             setDefaultValue(false)
         }.also(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = DOWNLOAD_UI_ENABLED_PREF
+            title = "Abrir interface de download em lotes"
+            summary = buildString {
+                append("Quando ativado, \"Abrir na WebView\" da obra abre a interface de download")
+                append(" em lotes (/download-ui/<slug>) na URL configurada abaixo.")
+                append(" Se a URL estiver vazia, abre a página normal.")
+            }
+            setDefaultValue(false)
+        }.also(screen::addPreference)
+
+        EditTextPreference(screen.context).apply {
+            key = DOWNLOAD_UI_URL_PREF
+            title = "URL da interface de download"
+            summary = "Host base, ex.: http://192.168.0.10:8080"
+            dialogMessage = "Digite só o host base (sem /download-ui). O slug é anexado automaticamente."
+            setDefaultValue("")
+        }.also(screen::addPreference)
+    }
+
+    // ============================== Assinatura (x-toon-signature) ==================
+
+    /**
+     * O ToonLivre passou a exigir uma assinatura em toda chamada à API. O valor é um
+     * JWT devolvido por `GET /api/seed` (validade ~30 min) que o cliente apenas
+     * reenvia no header. Tanto o **nome** do header (rotaciona a cada release web)
+     * quanto o valor são descobertos em runtime: o nome sai do bundle JS do site e o
+     * valor do `/api/seed`. Em caso de 403 "Acesso negado", reextrai tudo e repete
+     * a requisição uma vez.
+     */
+    private fun signatureInterceptor(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        if (request.url.host != baseUrlHost || request.url.encodedPath.endsWith("/api/seed")) {
+            return chain.proceed(request)
+        }
+
+        val response = chain.proceed(request.signed())
+        if (response.code == 403 && response.looksDenied()) {
+            response.close()
+            invalidateAuth()
+            return chain.proceed(request.signed())
+        }
+        return response
+    }
+
+    private fun Request.signed(): Request = newBuilder().header(authHeaderName(), authToken()).build()
+
+    private fun Response.looksDenied(): Boolean = try {
+        peekBody(MAX_PEEK).string().let { body ->
+            body.contains("requiresTurnstile", ignoreCase = true) ||
+                body.contains("Acesso negado", ignoreCase = true) ||
+                body.contains("aplicativo oficial", ignoreCase = true)
+        }
+    } catch (_: Exception) {
+        false
+    }
+
+    private fun authToken(): String {
+        val now = System.currentTimeMillis()
+        cachedToken?.let { if (now < tokenExpMs - REFRESH_MARGIN_MS) return it }
+        synchronized(authLock) {
+            val current = System.currentTimeMillis()
+            cachedToken?.let { if (current < tokenExpMs - REFRESH_MARGIN_MS) return it }
+            bootstrapClient.newCall(GET("$apiUrl/seed", headers)).execute().use { resp ->
+                if (!resp.isSuccessful) throw IOException(SEED_FAIL_MESSAGE)
+                val token = resp.body.string().parseAs<SeedTokenDto>().token
+                cachedToken = token
+                tokenExpMs = jwtExpMs(token)
+                return token
+            }
+        }
+    }
+
+    private fun jwtExpMs(token: String): Long = try {
+        val payload = token.split(".")[1]
+        val decoded = String(Base64.decode(payload, Base64.URL_SAFE or Base64.NO_PADDING), Charsets.UTF_8)
+        decoded.parseAs<JwtExpDto>().exp.takeIf { it > 0 }?.times(1000)
+            ?: (System.currentTimeMillis() + FALLBACK_TTL_MS)
+    } catch (_: Exception) {
+        System.currentTimeMillis() + FALLBACK_TTL_MS
+    }
+
+    private fun authHeaderName(): String {
+        ensureBundleMeta()
+        return cachedHeaderName ?: DEFAULT_HEADER
+    }
+
+    private fun invalidateAuth() {
+        synchronized(authLock) {
+            cachedToken = null
+            tokenExpMs = 0L
+        }
+        synchronized(bundleLock) { bundleMetaLoaded = false }
+    }
+
+    /**
+     * Raspagem única (cacheada) do bundle JS de entrada para descobrir o nome do
+     * header de assinatura e as constantes que compõem a passphrase de
+     * descriptografia (que podem versionar, ex. `...::v8` → `::v9`). Se qualquer
+     * passo falhar, os defaults conhecidos são usados.
+     */
+    private fun ensureBundleMeta() {
+        if (bundleMetaLoaded) return
+        synchronized(bundleLock) {
+            if (bundleMetaLoaded) return
+            try {
+                val html = bootstrapClient.newCall(GET("$baseUrl/", headers)).execute()
+                    .use { it.body.string() }
+                val bundlePath = BUNDLE_REGEX.find(html)?.groupValues?.get(1) ?: return
+                val bundleUrl = baseUrl.toHttpUrl().resolve(bundlePath)?.toString() ?: return
+                val js = bootstrapClient.newCall(GET(bundleUrl, headers)).execute()
+                    .use { it.body.string() }
+
+                AUTH_HEADER_REGEX.find(js)?.groupValues?.get(1)?.let { cachedHeaderName = it }
+                extractPassphraseConstants(js)?.let {
+                    cachedSalt1 = it[0]
+                    cachedSalt2 = it[1]
+                    cachedPrefix = it[2]
+                }
+                bundleMetaLoaded = true
+            } catch (_: Exception) {
+                // mantém defaults; tenta de novo numa próxima chamada
+            }
+        }
+    }
+
+    private fun extractPassphraseConstants(js: String): List<String>? {
+        val anchor = js.indexOf("getUTCDate")
+        if (anchor < 0) return null
+        val window = js.substring(anchor, minOf(anchor + 400, js.length))
+        val consts = SPLIT_REGEX.findAll(window).map { it.groupValues[1] }.take(3).toList()
+        return consts.takeIf { it.size == 3 }
+    }
+
+    // ============================== Descriptografia (Rabbit) =======================
+
+    /**
+     * As respostas de conteúdo vêm cifradas como `{"<hexkey>":"U2FsdGVk..."}`
+     * (CryptoJS Rabbit, formato OpenSSL). Este interceptor detecta o blob, decifra
+     * com a passphrase do dia e substitui o corpo pelo JSON claro, de forma
+     * transparente para os `*Parse` acima. Respostas em texto puro passam intactas.
+     */
+    private fun decryptInterceptor(chain: Interceptor.Chain): Response {
+        val response = chain.proceed(chain.request())
+        if (chain.request().url.host != baseUrlHost || !response.isSuccessful) {
+            return response
+        }
+        // Lê o corpo uma única vez e sempre reconstrói a Response (o corpo original é
+        // consumido por .string()). Se não for um pacote cifrado, devolve o mesmo
+        // conteúdo intacto; se for, devolve o JSON já decifrado.
+        val originalBody = response.body
+        val mediaType = originalBody.contentType()
+        val body = originalBody.string()
+        val blob = ENC_BLOB_REGEX.find(body)?.groupValues?.get(1)
+        val decrypted = blob?.let { decryptBlob(it) }
+        val content = decrypted ?: body
+        val newMediaType = if (decrypted != null) JSON_MEDIA_TYPE else mediaType
+        return response.newBuilder()
+            .body(content.toResponseBody(newMediaType))
+            .build()
+    }
+
+    /**
+     * A passphrase depende da data, mas o servidor a calcula no fuso horário dele
+     * (aparentemente o do Brasil, não UTC), então perto da virada do dia a data UTC
+     * pode divergir da do servidor por 1 dia. Tentamos as datas candidatas (UTC de
+     * hoje, ontem e amanhã) e ficamos com a que decifra para um JSON válido.
+     */
+    private fun decryptBlob(blob: String): String? {
+        for (passphrase in candidatePassphrases()) {
+            val plain = try {
+                RabbitCipher.decrypt(blob, passphrase)
+            } catch (_: Exception) {
+                continue
+            }
+            if (plain.trimStart().startsWith("{")) return plain
+        }
+        return null
+    }
+
+    private fun candidatePassphrases(): List<String> {
+        ensureBundleMeta()
+        val salt1 = cachedSalt1 ?: DEFAULT_SALT1
+        val salt2 = cachedSalt2 ?: DEFAULT_SALT2
+        val prefix = cachedPrefix ?: DEFAULT_PREFIX
+        return intArrayOf(0, -1, 1).map { offset ->
+            prefix + sha256Hex(utcDate(offset) + salt1 + salt2).substring(0, 8)
+        }
+    }
+
+    private fun sha256Hex(input: String): String = MessageDigest.getInstance("SHA-256")
+        .digest(input.toByteArray(Charsets.UTF_8))
+        .joinToString("") { "%02x".format(it) }
+
+    private fun utcDate(offsetDays: Int): String {
+        val calendar = Calendar.getInstance(TimeZone.getTimeZone("UTC"))
+        calendar.add(Calendar.DAY_OF_MONTH, offsetDays)
+        return SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.format(calendar.time)
     }
 
     // ============================== Helper =======================================
 
     /**
-     * Lê o corpo como JSON. Se vier HTML (página de despedida / redirecionamento do
-     * Cloudflare) ou vazio, falha com mensagem clara em vez de estourar no parser.
+     * Lê o corpo como JSON. Se vier HTML (Cloudflare / erro) ou vazio, falha com
+     * mensagem clara em vez de estourar no parser.
      */
     private inline fun <reified T> Response.parseJson(): T {
         val peek = peekBody(MAX_PEEK).string().trimStart()
@@ -193,111 +422,51 @@ abstract class MangaLivre :
         return parseAs<T>()
     }
 
-    @Volatile
-    private var cachedToken: ClientToken? = null
+    // Estado de assinatura/descriptografia (compartilhado entre threads do OkHttp).
+    @Volatile private var cachedToken: String? = null
 
-    @Volatile
-    private var cachedCandidates: List<ClientToken>? = null
+    @Volatile private var tokenExpMs: Long = 0L
 
-    private fun clientHeaderInterceptor(chain: Interceptor.Chain): Response {
-        val request = chain.request()
-        if (request.url.host != baseUrlHost) {
-            return chain.proceed(request)
-        }
+    @Volatile private var cachedHeaderName: String? = null
 
-        val token = currentToken()
-        val response = chain.proceed(request.withClientHeader(token))
-        if (response.code != 403 || !response.isOfficialAppError()) {
-            return response
-        }
+    @Volatile private var cachedSalt1: String? = null
 
-        // O header de cliente rotacionou. Redescobre os candidatos no bundle e testa
-        // cada um até a API parar de recusar, memorizando o que funcionar.
-        response.close()
-        for (candidate in refreshCandidates()) {
-            if (candidate == token) continue
-            val retry = chain.proceed(request.withClientHeader(candidate))
-            if (retry.code != 403 || !retry.isOfficialAppError()) {
-                cachedToken = candidate
-                return retry
-            }
-            retry.close()
-        }
-        return chain.proceed(request.withClientHeader(token))
-    }
+    @Volatile private var cachedSalt2: String? = null
 
-    private fun Request.withClientHeader(token: ClientToken): Request = newBuilder().header(token.header, token.value).build()
+    @Volatile private var cachedPrefix: String? = null
 
-    private fun currentToken(): ClientToken = cachedToken ?: synchronized(this) {
-        cachedToken ?: candidates().first().also { cachedToken = it }
-    }
+    @Volatile private var bundleMetaLoaded: Boolean = false
 
-    private fun candidates(): List<ClientToken> = cachedCandidates ?: refreshCandidates()
+    private val authLock = Any()
 
-    private fun refreshCandidates(): List<ClientToken> = synchronized(this) {
-        scrapeCandidates().also { cachedCandidates = it }
-    }
-
-    /**
-     * O front-end fixa o header de cliente no bundle, e nome/valor rotacionam toda
-     * hora (x-toonlivre-client/web-v8 -> x-app-key/web-z99 -> x-tly-token/v99-web-z).
-     * Em vez de fixar isso, coletamos os pares header/valor dos /assets (ignorando
-     * headers padrão) e o interceptor testa cada candidato quando a API recusa com 403.
-     */
-    private fun scrapeCandidates(): List<ClientToken> = try {
-        val html = scrapeClient.newCall(GET("$baseUrl/", headers)).execute()
-            .use { if (it.isSuccessful) it.body.string() else "" }
-        val assets = ASSET_REGEX.findAll(html).map { it.value }.distinct().toList()
-        val js = buildString {
-            assets.take(MAX_ASSETS).forEach { path ->
-                scrapeClient.newCall(GET("$baseUrl$path", headers)).execute()
-                    .use { if (it.isSuccessful) append(it.body.string()) }
-            }
-        }
-        extractCandidates(js)
-    } catch (_: Exception) {
-        listOf(DEFAULT_TOKEN)
-    }
-
-    private fun extractCandidates(js: String): List<ClientToken> {
-        val pairs = (HEADER_CALL_REGEX.findAll(js) + HEADER_OBJECT_REGEX.findAll(js))
-            .map { ClientToken(it.groupValues[1], it.groupValues[2]) }
-            .filterNot { it.header.lowercase() in STANDARD_HEADERS }
-            .distinct()
-            .toList()
-        val ranked = pairs.sortedByDescending {
-            it.value.length +
-                (if ('-' in it.value) 100 else 0) +
-                (if (it.header.startsWith("x-", ignoreCase = true)) 50 else 0)
-        }.take(MAX_CANDIDATES)
-        return (ranked + DEFAULT_TOKEN).distinct()
-    }
-
-    private fun Response.isOfficialAppError(): Boolean = try {
-        peekBody(MAX_PEEK).string().contains("aplicativo oficial", ignoreCase = true)
-    } catch (_: Exception) {
-        false
-    }
-
-    private data class ClientToken(val header: String, val value: String)
+    private val bundleLock = Any()
 
     companion object {
         private const val ALTERNATIVE_TITLE_PREF = "alternativeTitlePref"
-        private const val MAX_PEEK = 1024L
-        private const val MAX_ASSETS = 8
-        private const val MAX_CANDIDATES = 8
-        private const val NON_JSON_MESSAGE =
-            "Resposta não-JSON (Cloudflare ou header desatualizado). Abra a fonte na WebView do app e tente de novo."
-        private val DEFAULT_TOKEN = ClientToken("x-tly-token", "v99-web-z")
-        private val ASSET_REGEX = Regex("/assets/[\\w-]+\\.js")
+        private const val DOWNLOAD_UI_ENABLED_PREF = "downloadUiEnabledPref"
+        private const val DOWNLOAD_UI_URL_PREF = "downloadUiUrlPref"
 
-        // O front-end fixa o header de cliente de várias formas conforme o release:
-        // `Headers.set("nome","valor")`, `Headers.append("nome","valor")` ou um
-        // object-literal `{"x-...":"..."}` passado ao fetch/axios. Cobrimos as três.
-        private val HEADER_CALL_REGEX =
-            Regex("\\.(?:set|append)\\(\\s*\"([A-Za-z][\\w.-]{1,40})\"\\s*,\\s*\"([^\"]{1,60})\"\\s*\\)")
-        private val HEADER_OBJECT_REGEX =
-            Regex("\"(x-[\\w.-]{1,40})\"\\s*:\\s*\"([^\"]{1,60})\"", RegexOption.IGNORE_CASE)
-        private val STANDARD_HEADERS = setOf("content-type", "accept", "authorization", "x-csrf-token")
+        private const val MAX_PEEK = 1024L
+
+        private const val REFRESH_MARGIN_MS = 120_000L
+        private const val FALLBACK_TTL_MS = 25 * 60_000L
+
+        // Defaults conhecidos (2026-07-21); usados se a raspagem do bundle falhar.
+        private const val DEFAULT_HEADER = "x-toon-signature"
+        private const val DEFAULT_SALT1 = "toonlivre.com::v8"
+        private const val DEFAULT_SALT2 = "t8_4v2_b"
+        private const val DEFAULT_PREFIX = "Magnesium-Strike-Astonish3"
+
+        private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
+        private val BUNDLE_REGEX = """<script[^>]+src="([^"]*/assets/index-[^"]+\.js)"""".toRegex()
+        private val AUTH_HEADER_REGEX = """append\("(x-[\w-]+)",await""".toRegex()
+        private val SPLIT_REGEX = """"([^"]*)"\.split\(""\)""".toRegex()
+        private val ENC_BLOB_REGEX = """"(U2FsdGVk[A-Za-z0-9+/=]+)"""".toRegex()
+
+        private const val NON_JSON_MESSAGE =
+            "Resposta não-JSON (Cloudflare ou verificação pendente). Abra a fonte na WebView do app e tente de novo."
+        private const val SEED_FAIL_MESSAGE =
+            "Falha ao obter a assinatura de acesso (/api/seed). Verifique a conexão e tente novamente."
     }
 }
