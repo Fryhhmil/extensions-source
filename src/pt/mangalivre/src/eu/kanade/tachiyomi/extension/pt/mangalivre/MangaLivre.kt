@@ -303,7 +303,7 @@ abstract class MangaLivre :
     /**
      * Raspagem única (cacheada) do bundle JS de entrada para descobrir o nome do
      * header de assinatura e as constantes que compõem a passphrase de
-     * descriptografia (que podem versionar, ex. `...::v8` → `::v9`). Se qualquer
+     * descriptografia (que podem versionar, ex. `...::v8` → `...::w3`). Se qualquer
      * passo falhar, os defaults conhecidos são usados.
      */
     private fun ensureBundleMeta() {
@@ -332,11 +332,9 @@ abstract class MangaLivre :
     }
 
     private fun extractPassphraseConstants(js: String): List<String>? {
-        val anchor = js.indexOf("getUTCDate")
-        if (anchor < 0) return null
-        val window = js.substring(anchor, minOf(anchor + 400, js.length))
-        val consts = SPLIT_REGEX.findAll(window).map { it.groupValues[1] }.take(3).toList()
-        return consts.takeIf { it.size == 3 }
+        val match = PASSPHRASE_REGEX.find(js) ?: return null
+        // groups: 1 = salt1, 2 = salt2, 3 = prefix
+        return match.groupValues.subList(1, 4)
     }
 
     // ============================== Descriptografia (Rabbit) =======================
@@ -451,17 +449,23 @@ abstract class MangaLivre :
         private const val REFRESH_MARGIN_MS = 120_000L
         private const val FALLBACK_TTL_MS = 25 * 60_000L
 
-        // Defaults conhecidos (2026-07-21); usados se a raspagem do bundle falhar.
+        // Defaults conhecidos (2026-07-22); usados se a raspagem do bundle falhar.
         private const val DEFAULT_HEADER = "x-toon-signature"
-        private const val DEFAULT_SALT1 = "toonlivre.com::v8"
-        private const val DEFAULT_SALT2 = "t8_4v2_b"
-        private const val DEFAULT_PREFIX = "Magnesium-Strike-Astonish3"
+        private const val DEFAULT_SALT1 = "toonlivre.net::w3"
+        private const val DEFAULT_SALT2 = "r7_5m2_k"
+        private const val DEFAULT_PREFIX = "Phantom-Tide-Harvest8"
 
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
         private val BUNDLE_REGEX = """<script[^>]+src="([^"]*/assets/index-[^"]+\.js)"""".toRegex()
         private val AUTH_HEADER_REGEX = """append\("(x-[\w-]+)",await""".toRegex()
-        private val SPLIT_REGEX = """"([^"]*)"\.split\(""\)""".toRegex()
+
+        // Deriva a passphrase de descriptografia do bundle. O site monta
+        // `[new Date().toISOString().slice(0,10),"<salt1>","<salt2>"].join("")`,
+        // faz `SHA256(...).slice(0,8)` e prefixa `"<prefix>"`. Capturamos os três
+        // literais (salt1, salt2, prefix) para acompanhar as rotações.
+        private val PASSPHRASE_REGEX =
+            """toISOString\(\)\.slice\(0,\s*10\)\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"\]\.join\(""\)\s*;\s*return\s*"([^"]+)"\s*\+""".toRegex()
         private val ENC_BLOB_REGEX = """"(U2FsdGVk[A-Za-z0-9+/=]+)"""".toRegex()
 
         private const val NON_JSON_MESSAGE =
