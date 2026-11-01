@@ -332,10 +332,18 @@ abstract class MangaLivre :
     }
 
     private fun extractPassphraseConstants(js: String): List<String>? {
+        // Idioma atual: os literais são montados por `String.fromCharCode([...])`,
+        // então capturamos os três arrays de code points na ordem salt1, salt2, prefix.
+        PASSPHRASE_CHARCODE_REGEX.find(js)?.let { match ->
+            return (1..3).map { decodeCharCodes(match.groupValues[it]) }
+        }
+        // Fallback: idioma antigo com literais de string inline.
         val match = PASSPHRASE_REGEX.find(js) ?: return null
         // groups: 1 = salt1, 2 = salt2, 3 = prefix
         return match.groupValues.subList(1, 4)
     }
+
+    private fun decodeCharCodes(list: String): String = list.split(",").joinToString("") { it.trim().toInt().toChar().toString() }
 
     // ============================== Descriptografia (Rabbit) =======================
 
@@ -449,11 +457,11 @@ abstract class MangaLivre :
         private const val REFRESH_MARGIN_MS = 120_000L
         private const val FALLBACK_TTL_MS = 25 * 60_000L
 
-        // Defaults conhecidos (2026-07-22); usados se a raspagem do bundle falhar.
+        // Defaults conhecidos (2026-07-23); usados se a raspagem do bundle falhar.
         private const val DEFAULT_HEADER = "x-toon-signature"
-        private const val DEFAULT_SALT1 = "toonlivre.net::w3"
-        private const val DEFAULT_SALT2 = "r7_5m2_k"
-        private const val DEFAULT_PREFIX = "Phantom-Tide-Harvest8"
+        private const val DEFAULT_SALT1 = "toonlivre.net::x5"
+        private const val DEFAULT_SALT2 = "m3_9k4_v"
+        private const val DEFAULT_PREFIX = "Solstice-Echo-Radiance7"
 
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
@@ -461,9 +469,17 @@ abstract class MangaLivre :
         private val AUTH_HEADER_REGEX = """append\("(x-[\w-]+)",await""".toRegex()
 
         // Deriva a passphrase de descriptografia do bundle. O site monta
-        // `[new Date().toISOString().slice(0,10),"<salt1>","<salt2>"].join("")`,
-        // faz `SHA256(...).slice(0,8)` e prefixa `"<prefix>"`. Capturamos os três
+        // `[new Date().toISOString().slice(0,10),<salt1>,<salt2>].join("")`,
+        // faz `SHA256(...).slice(0,8)` e prefixa `<prefix>`. Capturamos os três
         // literais (salt1, salt2, prefix) para acompanhar as rotações.
+        //
+        // Idioma atual (2026-07-23): os literais são ofuscados via
+        // `String.fromCharCode([116,111,...])`; capturamos os três arrays de code
+        // points na ordem em que aparecem (salt1, salt2, prefix) e os decodificamos.
+        private val PASSPHRASE_CHARCODE_REGEX =
+            """toISOString\(\)\.slice\(0,\s*10\)[^}]*?\[([\d,\s]+)\]\)[^}]*?\[([\d,\s]+)\]\)[^}]*?\[([\d,\s]+)\]\)""".toRegex()
+
+        // Idioma antigo: literais de string inline dentro do array `.join("")`.
         private val PASSPHRASE_REGEX =
             """toISOString\(\)\.slice\(0,\s*10\)\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"\]\.join\(""\)\s*;\s*return\s*"([^"]+)"\s*\+""".toRegex()
         private val ENC_BLOB_REGEX = """"(U2FsdGVk[A-Za-z0-9+/=]+)"""".toRegex()

@@ -12,3 +12,5 @@ gen
 generated-src/
 .kotlin
 *.jks
+.local
+.github
