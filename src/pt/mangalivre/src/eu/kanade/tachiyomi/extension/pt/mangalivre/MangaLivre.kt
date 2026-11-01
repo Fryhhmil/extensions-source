@@ -6,8 +6,14 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.ResultReceiver
+import android.text.InputType
+import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
+import eu.kanade.tachiyomi.extension.pt.mangalivre.auth.LoginCredentials
+import eu.kanade.tachiyomi.extension.pt.mangalivre.auth.SessionStore
+import eu.kanade.tachiyomi.extension.pt.mangalivre.auth.StoredSession
+import eu.kanade.tachiyomi.extension.pt.mangalivre.auth.ToonLivreAuth
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -31,6 +37,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonElement
+import okhttp3.CookieJar
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -44,12 +51,29 @@ import kotlin.time.Duration.Companion.seconds
 abstract class MangaLivre :
     KeiSource(),
     ConfigurableSource {
-    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = rateLimit(2, 1.seconds) { it.host == baseUrl.toHttpUrl().host }
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = addInterceptor { auth.intercept(it) }
+        .addNetworkInterceptor { auth.attachCookies(it) }
+        .rateLimit(2, 1.seconds) { it.host == baseUrl.toHttpUrl().host }
 
     private val apiUrl: String get() = "$baseUrl/api"
 
     private val preferences by getPreferencesLazy()
     private val verificationMutex = Mutex()
+
+    private val auth by lazy {
+        ToonLivreAuth(
+            baseUrl = baseUrl,
+            // Without the app's cookie jar: the tokens stay in the preferences, see ToonLivreAuth.
+            authClient = network.client.newBuilder().cookieJar(CookieJar.NO_COOKIES).followRedirects(false).build(),
+            headers = { headers },
+            store = PreferencesSessionStore(),
+            credentials = {
+                val email = preferences.getString(EMAIL_PREF, "").orEmpty().trim()
+                val password = preferences.getString(PASSWORD_PREF, "").orEmpty()
+                LoginCredentials(email, password).takeIf { email.isNotEmpty() && password.isNotEmpty() }
+            },
+        )
+    }
 
     override fun Headers.Builder.configureHeaders(): Headers.Builder = set("Accept-Language", "pt-BR,en-US;q=0.9,en;q=0.8")
 
@@ -115,7 +139,14 @@ abstract class MangaLivre :
 
     // ============================== Details =======================================
 
-    override fun getMangaUrl(manga: SManga): String = "$baseUrl/${manga.url}"
+    override fun getMangaUrl(manga: SManga): String {
+        val downloadUiUrl = preferences.getString(DOWNLOAD_UI_URL_PREF, "").orEmpty().trim().trimEnd('/')
+        return if (preferences.getBoolean(DOWNLOAD_UI_ENABLED_PREF, false) && downloadUiUrl.isNotEmpty()) {
+            "$downloadUiUrl/download-ui/${manga.url}"
+        } else {
+            "$baseUrl/${manga.url}"
+        }
+    }
 
     override suspend fun fetchMangaUpdate(
         manga: SManga,
@@ -150,6 +181,8 @@ abstract class MangaLivre :
     private suspend fun fetchReaderAccess(ref: ChapterReferenceDto): ReaderAccessResponseDto? {
         client.post(
             "$apiUrl/reader/chapter/access",
+            // The site answers 404 without Origin, and the core only adds it to Chrome and Firefox user agents.
+            headers = headers.newBuilder().set("Origin", baseUrl).build(),
             fetch = Fetch.XHR,
             body = ref.toJsonRequestBody(),
             ensureSuccess = false,
@@ -157,6 +190,8 @@ abstract class MangaLivre :
             if (response.isSuccessful) return response.parseAs()
 
             val error = response.parseAs<ReaderAccessErrorDto>()
+            // A refused login would only reach the same verification: tell the user what to fix.
+            auth.lastFailure?.let { throw IOException(it) }
             if (response.code == 403 && error.error == READER_VERIFICATION_REQUIRED) return null
             throw IOException(error.error)
         }
@@ -235,6 +270,89 @@ abstract class MangaLivre :
                     }
                 setDefaultValue(false)
             }.also(screen::addPreference)
+
+        EditTextPreference(screen.context)
+            .apply {
+                key = EMAIL_PREF
+                title = "E-mail"
+                summary = "E-mail da sua conta do ToonLivre. Com e-mail e senha, o login é automático e o leitor não pede verificação."
+                setDefaultValue("")
+                setOnBindEditTextListener { it.inputType = InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS or InputType.TYPE_CLASS_TEXT }
+                setOnPreferenceChangeListener { _, _ ->
+                    auth.forgetSession()
+                    true
+                }
+            }.also(screen::addPreference)
+
+        EditTextPreference(screen.context)
+            .apply {
+                key = PASSWORD_PREF
+                title = "Senha"
+                summary = "Senha da sua conta do ToonLivre. Fica salva neste aparelho e só é enviada ao site."
+                setDefaultValue("")
+                setOnBindEditTextListener { it.inputType = InputType.TYPE_TEXT_VARIATION_PASSWORD or InputType.TYPE_CLASS_TEXT }
+                setOnPreferenceChangeListener { _, _ ->
+                    auth.forgetSession()
+                    true
+                }
+            }.also(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context)
+            .apply {
+                key = DOWNLOAD_UI_ENABLED_PREF
+                title = "Abrir interface de download em lotes"
+                summary =
+                    buildString {
+                        append("Quando ativado, abrir a obra na WebView leva à interface de download em lotes")
+                        append(" (/download-ui/<slug>) na URL abaixo. Com a URL vazia, abre a página normal.")
+                    }
+                setDefaultValue(false)
+            }.also(screen::addPreference)
+
+        EditTextPreference(screen.context)
+            .apply {
+                key = DOWNLOAD_UI_URL_PREF
+                title = "URL da interface de download"
+                summary = "Endereço do servidor, ex.: http://192.168.0.10:5000"
+                dialogMessage = "Digite só o endereço do servidor (sem /download-ui). O slug é anexado automaticamente."
+                setDefaultValue("")
+            }.also(screen::addPreference)
+    }
+
+    private inner class PreferencesSessionStore : SessionStore {
+        override fun load(): StoredSession? {
+            val accessToken = preferences.getString(ACCESS_TOKEN_PREF, null) ?: return null
+            val refreshToken = preferences.getString(REFRESH_TOKEN_PREF, null) ?: return null
+            val csrfToken = preferences.getString(CSRF_TOKEN_PREF, null) ?: return null
+            return StoredSession(
+                accessToken,
+                preferences.getLong(ACCESS_EXPIRES_PREF, 0L),
+                refreshToken,
+                preferences.getLong(REFRESH_EXPIRES_PREF, 0L),
+                csrfToken,
+            )
+        }
+
+        // commit: the site has already invalidated the old tokens, so they must not survive a crash.
+        override fun save(session: StoredSession) {
+            preferences.edit()
+                .putString(ACCESS_TOKEN_PREF, session.accessToken)
+                .putLong(ACCESS_EXPIRES_PREF, session.accessExpiresAt)
+                .putString(REFRESH_TOKEN_PREF, session.refreshToken)
+                .putLong(REFRESH_EXPIRES_PREF, session.refreshExpiresAt)
+                .putString(CSRF_TOKEN_PREF, session.csrfToken)
+                .commit()
+        }
+
+        override fun clear() {
+            preferences.edit()
+                .remove(ACCESS_TOKEN_PREF)
+                .remove(ACCESS_EXPIRES_PREF)
+                .remove(REFRESH_TOKEN_PREF)
+                .remove(REFRESH_EXPIRES_PREF)
+                .remove(CSRF_TOKEN_PREF)
+                .commit()
+        }
     }
 
     // ============================== Utilities =======================================
@@ -256,6 +374,15 @@ abstract class MangaLivre :
         private val PAGE_NUMBER_REGEX = Regex("""_(\d+)\.[^.]+$""")
 
         private const val ALTERNATIVE_TITLE_PREF = "alternativeTitlePref"
+        private const val DOWNLOAD_UI_ENABLED_PREF = "downloadUiEnabledPref"
+        private const val DOWNLOAD_UI_URL_PREF = "downloadUiUrlPref"
+        private const val EMAIL_PREF = "emailPref"
+        private const val PASSWORD_PREF = "passwordPref"
+        private const val ACCESS_TOKEN_PREF = "sessionAccessToken"
+        private const val ACCESS_EXPIRES_PREF = "sessionAccessExpiresAt"
+        private const val REFRESH_TOKEN_PREF = "sessionRefreshToken"
+        private const val REFRESH_EXPIRES_PREF = "sessionRefreshExpiresAt"
+        private const val CSRF_TOKEN_PREF = "sessionCsrfToken"
         private const val MAX_PEEK = 1024L
         private const val NON_JSON_MESSAGE =
             "Resposta não-JSON (Cloudflare ou header desatualizado). Abra a fonte na WebView do app e tente de novo."
